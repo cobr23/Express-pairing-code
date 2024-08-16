@@ -1,213 +1,119 @@
-import { Boom } from '@hapi/boom'
-import Baileys, {
-  DisconnectReason,
-  delay,
-  useMultiFileAuthState
-} from '@whiskeysockets/baileys'
-import cors from 'cors'
-import express from 'express'
-import fs from 'fs'
-import PastebinAPI from 'pastebin-js'
-import path, { dirname } from 'path'
-import pino from 'pino'
-import { fileURLToPath } from 'url'
-let pastebin = new PastebinAPI('EMWTMkQAVfJa9kM-MRUrxd5Oku1U7pgL')
+const PastebinAPI = require('pastebin-js'),
+pastebin = new PastebinAPI('EMWTMkQAVfJa9kM-MRUrxd5Oku1U7pgL')
+const {makeid} = require('./id')
+const id = makeid()
+const fs = require('fs')
+const pino = require('pino')
+const { default: makeWASocket, Browsers, delay, useMultiFileAuthState, BufferJSON, fetchLatestBaileysVersion, PHONENUMBER_MCC, DisconnectReason, makeInMemoryStore, jidNormalizedUser, makeCacheableSignalKeyStore } = require("@whiskeysockets/baileys")
+const Pino = require("pino")
+const NodeCache = require("node-cache")
+const chalk = require("chalk")
+const readline = require("readline")
+const { parsePhoneNumber } = require("libphonenumber-js")
 
-const app = express()
 
-app.use((req, res, next) => {
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
+let phoneNumber = "94711262551"
 
-  res.setHeader('Pragma', 'no-cache')
+const pairingCode = !!phoneNumber || process.argv.includes("--pairing-code")
+const useMobile = process.argv.includes("--mobile")
 
-  res.setHeader('Expires', '0')
-  next()
-})
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+const question = (text) => new Promise((resolve) => rl.question(text, resolve))
 
-app.use(cors())
-let PORT = process.env.PORT || 8000
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
 
-function createRandomId() {
-  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-  let id = ''
-  for (let i = 0; i < 10; i++) {
-    id += characters.charAt(Math.floor(Math.random() * characters.length))
-  }
-  return id
-}
+  async function qr() {
+//------------------------------------------------------
+let { version, isLatest } = await fetchLatestBaileysVersion()
+const {  state, saveCreds } =await useMultiFileAuthState('./session/'+id)
+    const msgRetryCounterCache = new NodeCache()
+    const sock = makeWASocket({
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: !pairingCode,
+      browser: Browsers.macOS('safari'), // for this issues https://github.com/WhiskeySockets/Baileys/issues/328
+     auth: {
+         creds: state.creds,
+         keys: makeCacheableSignalKeyStore(state.keys, Pino({ level: "fatal" }).child({ level: "fatal" })),
+      },
+      markOnlineOnConnect: true, // set false for offline
+      generateHighQualityLinkPreview: true, // make high preview link
+      getMessage: async (key) => {
+         let jid = jidNormalizedUser(key.remoteJid)
+         let msg = await store.loadMessage(jid, key.id)
 
-let sessionFolder = `./auth/${createRandomId()}`
-if (fs.existsSync(sessionFolder)) {
-  try {
-    fs.rmdirSync(sessionFolder, { recursive: true })
-    console.log('Deleted the "SESSION" folder.')
-  } catch (err) {
-    console.error('Error deleting the "SESSION" folder:', err)
-  }
-}
+         return msg?.message || ""
+      },
+      msgRetryCounterCache, // Resolve waiting messages
+      defaultQueryTimeoutMs: undefined, // for this issues https://github.com/WhiskeySockets/Baileys/issues/276
+   })
 
-let clearState = () => {
-  fs.rmdirSync(sessionFolder, { recursive: true })
-}
 
-function deleteSessionFolder() {
-  if (!fs.existsSync(sessionFolder)) {
-    console.log('The "SESSION" folder does not exist.')
-    return
-  }
+   if (pairingCode && !sock.authState.creds.registered) {
+      if (useMobile) throw new Error('Cannot use pairing code with mobile api')
 
-  try {
-    fs.rmdirSync(sessionFolder, { recursive: true })
-    console.log('Deleted the "SESSION" folder.')
-  } catch (err) {
-    console.error('Error deleting the "SESSION" folder:', err)
-  }
-}
+      let phoneNumber
+      if (!!phoneNumber) {
+         phoneNumber = phoneNumber.replace(/[^0-9]/g, '')
 
-app.get('/', async (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'))
-})
+         if (!Object.keys(PHONENUMBER_MCC).some(v => phoneNumber.startsWith(v))) {
+            console.log(chalk.bgBlack(chalk.redBright("Start with country code of your WhatsApp Number, Example :+")))
+            process.exit(0)
+         }
+      } else {
+         phoneNumber = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number \nFor example: +94711262551 : `)))
+         phoneNumber = phoneNumber.replace(/[^0-9]/g, '')
 
-app.get('/qr', async (req, res) => {
-  res.sendFile(path.join(__dirname, 'qr.html'))
-})
+         // Ask again when entering the wrong number
+         if (!Object.keys(PHONENUMBER_MCC).some(v => phoneNumber.startsWith(v))) {
+            console.log(chalk.bgBlack(chalk.redBright("Start with country code of your WhatsApp Number, Example : +94711262551")))
 
-app.get('/code', async (req, res) => {
-  res.sendFile(path.join(__dirname, 'pair.html'))
-})
-
-app.get('/pair', async (req, res) => {
-  let phone = req.query.phone
-
-  if (!phone) return res.json({ error: 'Please Provide Phone Number' })
-
-  try {
-    const code = await startnigg(phone)
-    res.json({ code: code })
-  } catch (error) {
-    console.error('Error in WhatsApp authentication:', error)
-    res.status(500).json({ error: 'Internal Server Error' })
-  }
-})
-
-async function startnigg(phone) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      if (!fs.existsSync(sessionFolder)) {
-        await fs.mkdirSync(sessionFolder)
+            phoneNumber = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number \nFor example: +94711262551 : `)))
+            phoneNumber = phoneNumber.replace(/[^0-9]/g, '')
+            rl.close()
+         }
       }
 
-      const { state, saveCreds } = await useMultiFileAuthState(sessionFolder)
-
-      const negga = Baileys.makeWASocket({
-        printQRInTerminal: false,
-        logger: pino({
-          level: 'silent',
-        }),
-        browser: ['Ubuntu', 'Chrome', '20.0.04'],
-        auth: state,
+      setTimeout(async () => {
+         let code = await sock.requestPairingCode(phoneNumber)
+         code = code?.match(/.{1,4}/g)?.join("-") || code
+         console.log(chalk.black(chalk.bgGreen(`Your Pairing Code : `)), chalk.black(chalk.white(code)))
+      }, 3000)
+   }
+//------------------------------------------------------
+    sock.ev.on("connection.update", async (s) => {
+    const { connection, lastDisconnect } = s;
+    if (connection == "open") {
+      await delay(1000 * 10);
+      const output = await pastebin.createPasteFromFile(__dirname+`/session/${id}/creds.json`, "pastebin-js test", null, 1, "N")
+      const ethix = await sock.sendMessage(sock.user.id, {
+        text: `Imalka-MD&` + output.split('/')[3]
       })
-
-      if (!negga.authState.creds.registered) {
-        let phoneNumber = phone ? phone.replace(/[^0-9]/g, '') : ''
-        if (phoneNumber.length < 11) {
-          return reject(new Error('Please Enter Your Number With Country Code !!'))
-        }
-        setTimeout(async () => {
-          try {
-            let code = await negga.requestPairingCode(phoneNumber)
-            console.log(`Your Pairing Code : ${code}`)
-            resolve(code)
-          } catch (requestPairingCodeError) {
-            const errorMessage = 'Error requesting pairing code from WhatsApp'
-            console.error(errorMessage, requestPairingCodeError)
-            return reject(new Error(errorMessage))
-          }
-        }, 2000)
-      }
-
-      negga.ev.on('creds.update', saveCreds)
-
-      negga.ev.on('connection.update', async update => {
-        const { connection, lastDisconnect } = update
-
-        if (connection === 'open') {
-          await delay(10000)
-
-          const output = await pastebin.createPasteFromFile(
-            `${sessionFolder}/creds.json`,
-            'Guru Bhai',
-            null,
-            1,
-            'N'
-          )
-          const sessi = 'GuruBot~' + output.split('https://pastebin.com/')[1]
-          console.log(sessi)
-          await delay(2000)
-          let guru = await negga.sendMessage(negga.user.id, { text: sessi })
-          await delay(2000)
-          await negga.sendMessage(
-            negga.user.id,
-            {
-              text: 'Hello there! 👋 \n\nDo not share your session id with anyone.\n\nPut the above in SESSION_ID var\n\nThanks for using GURU-BOT\n\n join support group:- https://chat.whatsapp.com/JY4R2D22pbLIKBMQWyBaLg \n',
-            },
-            { quoted: guru }
-          )
-
-          console.log('Connected to WhatsApp Servers')
-
-          try {
-            deleteSessionFolder()
-          } catch (error) {
-            console.error('Error deleting session folder:', error)
-          }
-
-          process.send('reset')
-        }
-
-        if (connection === 'close') {
-          let reason = new Boom(lastDisconnect?.error)?.output.statusCode
-          if (reason === DisconnectReason.connectionClosed) {
-            console.log('[Connection closed, reconnecting....!]')
-            process.send('reset')
-          } else if (reason === DisconnectReason.connectionLost) {
-            console.log('[Connection Lost from Server, reconnecting....!]')
-            process.send('reset')
-          } else if (reason === DisconnectReason.loggedOut) {
-            clearState()
-            console.log('[Device Logged Out, Please Try to Login Again....!]')
-            clearState()
-            process.send('reset')
-          } else if (reason === DisconnectReason.restartRequired) {
-            console.log('[Server Restarting....!]')
-            startnigg()
-          } else if (reason === DisconnectReason.timedOut) {
-            console.log('[Connection Timed Out, Trying to Reconnect....!]')
-            process.send('reset')
-          } else if (reason === DisconnectReason.badSession) {
-            console.log('[BadSession exists, Trying to Reconnect....!]')
-            clearState()
-            process.send('reset')
-          } else if (reason === DisconnectReason.connectionReplaced) {
-            console.log(`[Connection Replaced, Trying to Reconnect....!]`)
-            process.send('reset')
-          } else {
-            console.log('[Server Disconnected: Maybe Your WhatsApp Account got Fucked....!]')
-            process.send('reset')
-          }
-        }
-      })
-
-      negga.ev.on('messages.upsert', () => {})
-    } catch (error) {
-      console.error('An Error Occurred:', error)
-      throw new Error('An Error Occurred')
+      sock.groupAcceptInvite("CPUDKTYNb6Y9zENvySnBZC");
+      await sock.sendMessage(sock.user.id, { text: `> ⚠️ DO NOT SHARE THIS SESSION-ID WITH ANYBODY ❌` }, { quoted: hansamal });
+      await delay(1000 * 2);
+      process.exit(0);
     }
-  })
+        if (
+            connection === "close" &&
+            lastDisconnect &&
+            lastDisconnect.error &&
+            lastDisconnect.error.output.statusCode != 401
+        ) {
+            qr()
+        }
+    })
+    sock.ev.on('creds.update', saveCreds)
+    sock.ev.on("messages.upsert",  () => { })
 }
+qr()
 
-app.listen(PORT, () => {
-  console.log(`API Running on PORT:${PORT}`)
+process.on('uncaughtException', function (err) {
+let e = String(err)
+if (e.includes("conflict")) return
+if (e.includes("not-authorized")) return
+if (e.includes("Socket connection timeout")) return
+if (e.includes("rate-overlimit")) return
+if (e.includes("Connection Closed")) return
+if (e.includes("Timed Out")) return
+if (e.includes("Value not found")) return
+console.log('Caught exception: ', err)
 })
